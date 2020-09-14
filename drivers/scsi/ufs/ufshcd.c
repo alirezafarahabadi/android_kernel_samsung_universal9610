@@ -1868,6 +1868,21 @@ start:
 		if (async)
 			hba->clk_gating.active_reqs--;
 	case CLKS_ON:
+		/*
+		 * Wait for the ungate work to complete if in progress.
+		 * Though the clocks may be in ON state, the link could
+		 * still be in hibner8 state if hibern8 is allowed
+		 * during clock gating.
+		 * Make sure we exit hibern8 state also in addition to
+		 * clocks being ON.
+		 */
+		if (!async && ufshcd_can_hibern8_during_gating(hba) &&
+			ufshcd_is_link_hibern8(hba)) {
+			spin_unlock_irqrestore(hba->host->host_lock, flags);
+			flush_work(&hba->clk_gating.ungate_work);
+			spin_lock_irqsave(hba->host->host_lock, flags);
+			goto start;
+		}
 		break;
 	case REQ_CLKS_OFF:
 		if (cancel_delayed_work(&hba->clk_gating.gate_work)) {
@@ -3105,7 +3120,8 @@ static bool ufshcd_get_dev_cmd_tag(struct ufs_hba *hba, int *tag_out)
 
 	do {
 		tmp = ~hba->lrb_in_use;
-		tag = find_last_bit(&tmp, hba->nutrs);
+		tmp &= BITMAP_LAST_WORD_MASK(hba->nutrs);
+		tag = (int)(tmp) ? __fls(tmp) : ~0;
 		if (tag >= hba->nutrs)
 			goto out;
 	} while (test_and_set_bit_lock(tag, &hba->lrb_in_use));
@@ -3138,9 +3154,18 @@ static int ufshcd_exec_dev_cmd(struct ufs_hba *hba,
 	int tag;
 	struct completion wait;
 	unsigned long flags;
+	ktime_t start = ktime_get();
 
-	if (!ufshcd_is_link_active(hba))
-		return -EPERM;
+	/*
+	* Add timeout to ensure link actvie status.
+	* There is a case where link activity takes
+	* a long time during tw control.
+	*/
+	while (!ufshcd_is_link_active(hba)) {
+		if (ktime_to_us(ktime_sub(ktime_get(), start)) > 50000)
+			return -EPERM;
+		usleep_range(200, 400);
+	}
 
 	down_read(&hba->clk_scaling_lock);
 
@@ -8829,7 +8854,6 @@ disable_clks:
 
 	hba->clk_gating.state = CLKS_OFF;
 	trace_ufshcd_clk_gating(dev_name(hba->dev), hba->clk_gating.state);
-	mdelay(10);
 	/*
 	 * Call vendor specific suspend callback. As these callbacks may access
 	 * vendor specific host controller register space call them before the
